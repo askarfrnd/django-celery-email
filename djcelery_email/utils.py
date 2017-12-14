@@ -1,9 +1,6 @@
 import copy
 import base64
 from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-from email.mime.audio import MIMEAudio
 
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives, EmailMessage
@@ -36,6 +33,7 @@ def email_to_dict(message):
                     'bcc': message.bcc,
                     # ignore connection
                     'attachments': [],
+                    'attachment_headers': {},
                     'headers': message.extra_headers,
                     'cc': message.cc}
 
@@ -52,21 +50,25 @@ def email_to_dict(message):
         message_dict["mixed_subtype"] = message.mixed_subtype
 
     attachments = message.attachments
-    for attachment in attachments:
+    for idx, attachment in enumerate(attachments):
         if isinstance(attachment, MIMEBase):
             filename = attachment.get_filename('')
             binary_contents = attachment.get_payload(decode=True)
             mimetype = attachment.get_content_type()
-            mime = True
+
+            message_dict['attachment_headers'][str(idx)] = \
+                attachment._headers
         else:
             filename, binary_contents, mimetype = attachment
-            mime = False
         contents = base64.b64encode(binary_contents).decode('ascii')
-        message_dict['attachments'].append((filename, contents, mimetype, mime))
+
+        message_dict['attachments'].append((filename, contents, mimetype))
+
     if settings.CELERY_EMAIL_MESSAGE_EXTRA_ATTRIBUTES:
         for attr in settings.CELERY_EMAIL_MESSAGE_EXTRA_ATTRIBUTES:
             if hasattr(message, attr):
                 message_dict[attr] = getattr(message, attr)
+
     return message_dict
 
 
@@ -79,6 +81,7 @@ def dict_to_email(messagedict):
                 extra_attrs[attr] = messagedict.pop(attr)
 
     attachments = messagedict.pop('attachments')
+    attachment_headers = messagedict.pop('attachment_headers')
 
     if isinstance(messagedict, dict) and "content_subtype" in messagedict:
         content_subtype = messagedict["content_subtype"]
@@ -90,12 +93,65 @@ def dict_to_email(messagedict):
         del messagedict["mixed_subtype"]
     else:
         mixed_subtype = None
+
     if hasattr(messagedict, 'from_email'):
         ret = messagedict
     elif 'alternatives' in messagedict:
         ret = EmailMultiAlternatives(**messagedict)
     else:
         ret = EmailMessage(**messagedict)
+
+    if isinstance(ret, EmailMessage):
+        # Properly build attachments with headers
+        for index, attachment in enumerate(attachments):
+            # Extract attachment params
+            attachment_filename = attachment[0]
+            attachment_mime = attachment[2]
+            attachment_payload = base64.b64decode(attachment[1].encode('ascii'))
+
+            if attachment_mime is None:
+                attachment_type = 'application'
+                attachment_subtype = 'octet-stream'
+            else:
+                attachment_type, attachment_subtype = attachment_mime.split('/')
+
+            if str(index) in attachment_headers:
+
+                # Create attachment object
+                mime = MIMEBase(attachment_type, attachment_subtype)
+                for header_key, header_value in attachment_headers[str(index)]:
+                    try:
+                        mime.replace_header(header_key, header_value)
+                    except KeyError:
+                        mime.add_header(header_key, header_value)
+
+                mime.set_payload(
+                    base64.b64encode(attachment_payload).decode('ascii')
+                )
+
+                # Assign attachment headers
+                for header in attachment_headers[str(index)]:
+                    header, header_value = header
+                    try:
+                        mime.replace_header(header, header_value)
+                    except KeyError:
+                        mime.add_header(header, header_value)
+
+                try:
+                    mime.replace_header('Content-Transfer-Encoding', 'base64')
+                except KeyError:
+                    mime.add_header('Content-Transfer-Encoding', 'base64')
+
+                ret.attach(mime)
+            else:
+                ret.attach(attachment_filename, attachment_payload, attachment_mime)
+    else:
+        for attachment in attachments:
+            filename, contents, mimetype, headers = attachment
+            binary_contents = base64.b64decode(contents.encode('ascii'))
+            messagedict['attachments'].append(
+                (filename, binary_contents, mimetype))
+
     for attr, val in extra_attrs.items():
         setattr(ret, attr, val)
     if content_subtype:
@@ -104,24 +160,5 @@ def dict_to_email(messagedict):
     if mixed_subtype:
         ret.mixed_subtype = mixed_subtype
         messagedict["mixed_subtype"] = mixed_subtype  # bring back mixed subtype for 'retry'
-
-    for attachment in attachments:
-        filename, contents, mimetype, mime = attachment
-        binary_contents = base64.b64decode(contents.encode('ascii'))
-        if mime:
-            maintype, subtype = mimetype.split('/', 1)
-            if maintype == 'text':
-                attch = MIMEText(binary_contents, _subtype=subtype)
-            elif maintype == 'image':
-                attch = MIMEImage(binary_contents, _subtype=subtype)
-            elif maintype == 'audio':
-                attch = MIMEAudio(binary_contents, _subtype=subtype)
-            else:
-                attch = MIMEBase(binary_contents, subtype)
-            attch.add_header('Content-Disposition', 'attachment; filename="%s"' % filename)
-            attch.add_header('Content-ID', '<%s>' % filename)
-            ret.attach(attch)
-        else:
-            ret.attach(filename, binary_contents, mimetype)
 
     return ret
